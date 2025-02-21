@@ -160,6 +160,8 @@ where
             } else {
                 warn!(error=?err, "gRPC call {} retried {} times", self.call_name, cur_attempt);
             }
+        } else {
+            debug!(error=?err, "gRPC call {} retried {} times", self.call_name, cur_attempt);
         }
     }
 }
@@ -196,8 +198,20 @@ where
     type OutError = tonic::Status;
 
     fn handle(&mut self, current_attempt: usize, e: tonic::Status) -> RetryPolicy<tonic::Status> {
+        debug!(
+            status=?e,
+            current_attempt,
+            call_type=?self.call_type,
+            have_retried_goaway_cancel=self.have_retried_goaway_cancel,
+            "Handling gRPC error for {}", self.call_name
+        );
+
         // 0 max retries means unlimited retries
         if self.max_retries > 0 && current_attempt >= self.max_retries {
+            debug!(
+                "gRPC call {} failed after {} attempts",
+                self.call_name, current_attempt
+            );
             return RetryPolicy::ForwardError(e);
         }
 
@@ -219,9 +233,17 @@ where
                 .and_then(|tec| tec.downcast_ref::<hyper::Error>())
             {
                 if format!("{e:?}").contains("connection closed") {
+                    debug!("gRPC call {} failed with GOAWAY, retrying", self.call_name);
                     goaway_retry_allowed = true;
                     self.have_retried_goaway_cancel = true;
+                } else {
+                    debug!(
+                        "gRPC call {} cancelled, but not due to GOAWAY",
+                        self.call_name
+                    );
                 }
+            } else {
+                debug!("Fail to get source error for gRPC call {}", self.call_name);
             }
         }
 
@@ -233,7 +255,10 @@ where
             }
 
             match self.backoff.next_backoff() {
-                None => RetryPolicy::ForwardError(e), // None is returned when we've ran out of time
+                None => {
+                    debug!("Backoff time exceeded for gRPC call {}", self.call_name);
+                    RetryPolicy::ForwardError(e) // None is returned when we've ran out of time
+                }
                 Some(backoff) => {
                     // We treat ResourceExhausted as a special case and backoff more
                     // so we don't overload the server
@@ -253,6 +278,7 @@ where
             // stupid error codes while getting ready, among other weird infra issues
             RetryPolicy::WaitRetry(self.backoff.max_interval)
         } else {
+            debug!(error=?e, "gRPC call {} failed with non-retryable error", self.call_name);
             RetryPolicy::ForwardError(e)
         }
     }
